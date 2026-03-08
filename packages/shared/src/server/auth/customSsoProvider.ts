@@ -27,7 +27,7 @@ export function CustomSSOProvider<P extends CustomSSOUser>(
         id: profile[CUSTOM_SUB_CLAIM],
         name: profile[CUSTOM_NAME_CLAIM],
         // Fall back to "mail" (LDAP/AD-style) if the configured claim is absent
-        email: profile[CUSTOM_EMAIL_CLAIM] ?? profile["mail"],
+        email: profile[CUSTOM_EMAIL_CLAIM] || profile["mail"],
         image: null,
       };
     },
