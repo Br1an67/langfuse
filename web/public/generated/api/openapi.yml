@@ -650,6 +650,53 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateBlobStorageIntegrationRequest'
   /api/public/integrations/blob-storage/{id}:
+    get:
+      description: >-
+        Get the sync status of a blob storage integration by integration ID
+        (requires organization-scoped API key)
+      operationId: blobStorageIntegrations_getBlobStorageIntegrationStatus
+      tags:
+        - BlobStorageIntegrations
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BlobStorageIntegrationStatusResponse'
+        '400':
+          description: ''
+          content:
+            application/json:
+              schema: {}
+        '401':
+          description: ''
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: ''
+          content:
+            application/json:
+              schema: {}
+        '404':
+          description: ''
+          content:
+            application/json:
+              schema: {}
+        '405':
+          description: ''
+          content:
+            application/json:
+              schema: {}
+      security:
+        - BasicAuth: []
     delete:
       description: >-
         Delete a blob storage integration by ID (requires organization-scoped
@@ -4370,6 +4417,17 @@ paths:
           schema:
             type: string
             nullable: true
+        - name: resolve
+          in: query
+          description: >-
+            Resolve prompt dependencies before returning the prompt. Defaults to
+            `true`. Set to `false` to return the raw stored prompt with
+            dependency tags intact. This bypasses prompt caching and is intended
+            for debugging or one-off jobs, not production runtime fetches.
+          required: false
+          schema:
+            type: boolean
+            nullable: true
       responses:
         '200':
           description: ''
@@ -5581,6 +5639,19 @@ paths:
           required: true
           schema:
             type: string
+        - name: fields
+          in: query
+          description: >-
+            Comma-separated list of fields to include in the response. Available
+            field groups: 'core' (always included), 'io' (input, output,
+            metadata), 'scores', 'observations', 'metrics'. If not specified,
+            all fields are returned. Example: 'core,scores,metrics'. Note:
+            Excluded 'observations' or 'scores' fields return empty arrays;
+            excluded 'metrics' returns -1 for 'totalCost' and 'latency'.
+          required: false
+          schema:
+            type: string
+            nullable: true
       responses:
         '200':
           description: ''
@@ -6254,7 +6325,11 @@ components:
           $ref: '#/components/schemas/BlobStorageIntegrationType'
         bucketName:
           type: string
-          description: Name of the storage bucket
+          description: >-
+            Name of the storage bucket. For AZURE_BLOB_STORAGE, must be a valid
+            Azure container name (3-63 chars, lowercase letters, numbers, and
+            hyphens only, must start and end with a letter or number, no
+            consecutive hyphens).
         endpoint:
           type: string
           nullable: true
@@ -6295,6 +6370,12 @@ components:
           description: >-
             Custom start date for exports (required when exportMode is
             FROM_CUSTOM_DATE)
+        compressed:
+          type: boolean
+          nullable: true
+          description: >-
+            Enable gzip compression for exported files (.csv.gz, .json.gz,
+            .jsonl.gz). Defaults to true.
       required:
         - projectId
         - type
@@ -6341,11 +6422,20 @@ components:
           type: string
           format: date-time
           nullable: true
+        compressed:
+          type: boolean
         nextSyncAt:
           type: string
           format: date-time
           nullable: true
         lastSyncAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastError:
+          type: string
+          nullable: true
+        lastErrorAt:
           type: string
           format: date-time
           nullable: true
@@ -6367,6 +6457,7 @@ components:
         - forcePathStyle
         - fileType
         - exportMode
+        - compressed
         - createdAt
         - updatedAt
     BlobStorageIntegrationsResponse:
@@ -6379,6 +6470,79 @@ components:
             $ref: '#/components/schemas/BlobStorageIntegrationResponse'
       required:
         - data
+    BlobStorageSyncStatus:
+      title: BlobStorageSyncStatus
+      type: string
+      enum:
+        - idle
+        - queued
+        - up_to_date
+        - disabled
+        - error
+      description: >-
+        Sync status of the blob storage integration:
+
+        - `disabled` — integration is not enabled
+
+        - `error` — last export failed (see `lastError` for details)
+
+        - `idle` — enabled but has never exported yet
+
+        - `queued` — next export is overdue (`nextSyncAt` is in the past) and
+        waiting to be picked up by the worker
+
+        - `up_to_date` — all available data has been exported; next export is
+        scheduled for the future
+
+
+        **ETL usage**: poll this endpoint and check for `up_to_date` status.
+        Compare `lastSyncAt` against your
+
+        ETL bookmark to determine if new data is available. Note that exports
+        run with a 30-minute lag buffer,
+
+        so `lastSyncAt` will always be at least 30 minutes behind real-time.
+    BlobStorageIntegrationStatusResponse:
+      title: BlobStorageIntegrationStatusResponse
+      type: object
+      properties:
+        id:
+          type: string
+        projectId:
+          type: string
+        syncStatus:
+          $ref: '#/components/schemas/BlobStorageSyncStatus'
+        enabled:
+          type: boolean
+        lastSyncAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            End of the last successfully exported time window. Compare against
+            your ETL bookmark to determine if new data is available. Null if the
+            integration has never synced.
+        nextSyncAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the next export is scheduled. Null if no sync has occurred yet.
+        lastError:
+          type: string
+          nullable: true
+          description: >-
+            Raw error message from the storage provider (S3/Azure/GCS) if the
+            last export failed. Cleared on successful export.
+        lastErrorAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the last error occurred. Cleared on successful export.
+      required:
+        - id
+        - projectId
+        - syncStatus
+        - enabled
     BlobStorageIntegrationDeletionResponse:
       title: BlobStorageIntegrationDeletionResponse
       type: object
@@ -7145,6 +7309,17 @@ components:
         - stringValue
       allOf:
         - $ref: '#/components/schemas/BaseScoreV1'
+    TextScoreV1:
+      title: TextScoreV1
+      type: object
+      properties:
+        stringValue:
+          type: string
+          description: The text content of the score (1-500 characters)
+      required:
+        - stringValue
+      allOf:
+        - $ref: '#/components/schemas/BaseScoreV1'
     ScoreV1:
       title: ScoreV1
       oneOf:
@@ -7179,6 +7354,17 @@ components:
                   enum:
                     - BOOLEAN
             - $ref: '#/components/schemas/BooleanScoreV1'
+          required:
+            - dataType
+        - type: object
+          allOf:
+            - type: object
+              properties:
+                dataType:
+                  type: string
+                  enum:
+                    - TEXT
+            - $ref: '#/components/schemas/TextScoreV1'
           required:
             - dataType
     BaseScore:
@@ -7322,6 +7508,17 @@ components:
         - stringValue
       allOf:
         - $ref: '#/components/schemas/BaseScore'
+    TextScore:
+      title: TextScore
+      type: object
+      properties:
+        stringValue:
+          type: string
+          description: The text content of the score (1-500 characters)
+      required:
+        - stringValue
+      allOf:
+        - $ref: '#/components/schemas/BaseScore'
     Score:
       title: Score
       oneOf:
@@ -7369,6 +7566,17 @@ components:
             - $ref: '#/components/schemas/CorrectionScore'
           required:
             - dataType
+        - type: object
+          allOf:
+            - type: object
+              properties:
+                dataType:
+                  type: string
+                  enum:
+                    - TEXT
+            - $ref: '#/components/schemas/TextScore'
+          required:
+            - dataType
     CreateScoreValue:
       title: CreateScoreValue
       oneOf:
@@ -7376,8 +7584,8 @@ components:
           format: double
         - type: string
       description: >-
-        The value of the score. Must be passed as string for categorical scores,
-        and numeric for boolean and numeric scores
+        The value of the score. Must be passed as string for categorical and
+        text scores, and numeric for boolean and numeric scores
     Comment:
       title: Comment
       type: object
@@ -8097,6 +8305,7 @@ components:
         - NUMERIC
         - BOOLEAN
         - CATEGORICAL
+        - TEXT
     ScoreDataType:
       title: ScoreDataType
       type: string
@@ -8105,6 +8314,7 @@ components:
         - BOOLEAN
         - CATEGORICAL
         - CORRECTION
+        - TEXT
     DeleteDatasetItemResponse:
       title: DeleteDatasetItemResponse
       type: object
@@ -8195,6 +8405,13 @@ components:
             at or before this timestamp.
 
             If not provided, uses the latest version of dataset items.
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            Optional timestamp to set the createdAt field of the dataset run
+            item. If not provided or null, defaults to current timestamp.
       required:
         - runName
         - datasetItemId
@@ -8724,9 +8941,10 @@ components:
         value:
           $ref: '#/components/schemas/CreateScoreValue'
           description: >-
-            The value of the score. Must be passed as string for categorical
-            scores, and numeric for boolean and numeric scores. Boolean score
-            values must equal either 1 or 0 (true or false)
+            The value of the score. Must be passed as string for categorical and
+            text scores, and numeric for boolean and numeric scores. Boolean
+            score values must equal either 1 or 0 (true or false). Text score
+            values must be between 1 and 500 characters.
         comment:
           type: string
           nullable: true
@@ -9043,9 +9261,10 @@ components:
         value:
           $ref: '#/components/schemas/CreateScoreValue'
           description: >-
-            The value of the score. Must be passed as string for categorical
-            scores, and numeric for boolean and numeric scores. Boolean score
-            values must equal either 1 or 0 (true or false)
+            The value of the score. Must be passed as string for categorical and
+            text scores, and numeric for boolean and numeric scores. Boolean
+            score values must equal either 1 or 0 (true or false). Text score
+            values must be between 1 and 500 characters.
         comment:
           type: string
           nullable: true
@@ -10147,8 +10366,8 @@ components:
           additionalProperties: true
           nullable: true
           description: >-
-            The dependency resolution graph for the current prompt. Null if
-            prompt has no dependencies.
+            The dependency resolution graph for the current prompt. Null if the
+            prompt has no dependencies or if `resolve=false` was used.
       required:
         - name
         - version
@@ -10541,6 +10760,9 @@ components:
       properties:
         name:
           type: string
+          description: >-
+            Name of the score config. Max 35 characters. Only letters, numbers,
+            underscores, spaces, periods, parentheses, and hyphens are allowed.
         dataType:
           $ref: '#/components/schemas/ScoreConfigDataType'
         categories:
@@ -10587,7 +10809,9 @@ components:
         name:
           type: string
           nullable: true
-          description: The name of the score config
+          description: >-
+            Name of the score config. Max 35 characters. Only letters, numbers,
+            underscores, spaces, periods, parentheses, and hyphens are allowed.
         categories:
           type: array
           items:
@@ -10676,6 +10900,15 @@ components:
           nullable: true
       allOf:
         - $ref: '#/components/schemas/CorrectionScore'
+    GetScoresResponseDataText:
+      title: GetScoresResponseDataText
+      type: object
+      properties:
+        trace:
+          $ref: '#/components/schemas/GetScoresResponseTraceData'
+          nullable: true
+      allOf:
+        - $ref: '#/components/schemas/TextScore'
     GetScoresResponseData:
       title: GetScoresResponseData
       oneOf:
@@ -10721,6 +10954,17 @@ components:
                   enum:
                     - CORRECTION
             - $ref: '#/components/schemas/GetScoresResponseDataCorrection'
+          required:
+            - dataType
+        - type: object
+          allOf:
+            - type: object
+              properties:
+                dataType:
+                  type: string
+                  enum:
+                    - TEXT
+            - $ref: '#/components/schemas/GetScoresResponseDataText'
           required:
             - dataType
     GetScoresResponse:

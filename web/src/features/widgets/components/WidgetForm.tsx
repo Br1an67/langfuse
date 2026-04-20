@@ -27,7 +27,7 @@ import { WidgetPropertySelectItem } from "@/src/features/widgets/components/Widg
 import { Label } from "@/src/components/ui/label";
 import { Alert, AlertDescription, AlertTitle } from "@/src/components/ui/alert";
 import { viewDeclarations, requiresV2 } from "@/src/features/query/dataModel";
-import { type z } from "zod/v4";
+import { type z } from "zod";
 import { views, viewsV2 } from "@/src/features/query/types";
 import { type ViewVersion } from "@/src/features/query";
 import { useV4Beta } from "@/src/features/events/hooks/useV4Beta";
@@ -75,7 +75,10 @@ import {
   MAX_PIVOT_TABLE_METRICS,
 } from "@/src/features/widgets/utils/pivot-table-utils";
 import { ChartLoadingState } from "@/src/features/widgets/chart-library/ChartLoadingState";
-import { getChartLoadingStateProps } from "@/src/features/widgets/chart-library/chartLoadingStateUtils";
+import {
+  getChartLoadingProgress,
+  getChartLoadingStateProps,
+} from "@/src/features/widgets/chart-library/chartLoadingStateUtils";
 
 type ChartType = {
   group: "time-series" | "total-value";
@@ -152,6 +155,11 @@ const chartTypes: ChartType[] = [
  * Pure function that resolves the correct aggregation and chart type given the
  * current selections and valid aggregation list. Returns null when no change is
  * needed.
+ *
+ * All constraints are resolved in a single pass so the output is a fixed point
+ * (running the function again on its own output always returns null). This
+ * prevents infinite React state-update loops when constraints conflict — e.g.
+ * HISTOGRAM requires "histogram" aggregation but "count" measure forces "count".
  */
 export function resolveAggregationAndChartType(params: {
   chartType: string;
@@ -165,34 +173,50 @@ export function resolveAggregationAndChartType(params: {
   const { chartType, measure, currentAgg, validAggs } = params;
   const supportsHistogram = validAggs.includes("histogram");
 
-  // HISTOGRAM chart with a measure that doesn't support it — bail out of both
-  if (chartType === "HISTOGRAM" && !supportsHistogram) {
-    return { chartType: "NUMBER", aggregation: validAggs[0] ?? "count" };
+  let targetChart = chartType;
+  let targetAgg = currentAgg as z.infer<typeof metricAggregations>;
+
+  // HISTOGRAM chart needs a histogram-compatible measure
+  if (targetChart === "HISTOGRAM") {
+    if (!supportsHistogram) {
+      targetChart = "NUMBER";
+    } else {
+      targetAgg = "histogram";
+    }
   }
 
-  // HISTOGRAM chart forces histogram aggregation
-  if (chartType === "HISTOGRAM" && currentAgg !== "histogram") {
-    return { aggregation: "histogram" };
+  // Non-HISTOGRAM chart can't keep histogram aggregation
+  if (targetChart !== "HISTOGRAM" && targetAgg === "histogram") {
+    targetAgg =
+      measure === "count"
+        ? "count"
+        : ((validAggs[0] ?? "sum") as z.infer<typeof metricAggregations>);
   }
 
-  // Switched away from HISTOGRAM chart but aggregation still histogram
-  if (chartType !== "HISTOGRAM" && currentAgg === "histogram") {
-    return {
-      aggregation: measure === "count" ? "count" : (validAggs[0] ?? "sum"),
-    };
+  // "count" measure only supports "count" aggregation. If this conflicts with
+  // the chart type (e.g. HISTOGRAM requires "histogram"), bail the chart type
+  // rather than creating an unresolvable conflict.
+  if (measure === "count" && targetAgg !== "count") {
+    if (targetChart === "HISTOGRAM") {
+      targetChart = "NUMBER";
+    }
+    targetAgg = "count";
   }
 
-  // "count" measure always uses "count" aggregation (outside HISTOGRAM charts)
-  if (measure === "count" && currentAgg !== "count") {
-    return { aggregation: "count" };
+  // Current aggregation not valid for the measure type
+  if (!validAggs.includes(targetAgg)) {
+    targetAgg = (validAggs[0] ?? "count") as z.infer<typeof metricAggregations>;
   }
 
-  // Current aggregation is not valid for the measure type
-  if (!validAggs.includes(currentAgg as z.infer<typeof metricAggregations>)) {
-    return { aggregation: validAggs[0] ?? "count" };
-  }
+  // Only return if something changed
+  const result: {
+    aggregation?: z.infer<typeof metricAggregations>;
+    chartType?: string;
+  } = {};
+  if (targetChart !== chartType) result.chartType = targetChart;
+  if (targetAgg !== currentAgg) result.aggregation = targetAgg;
 
-  return null;
+  return Object.keys(result).length > 0 ? result : null;
 }
 
 /**
@@ -567,6 +591,12 @@ export function WidgetForm({
   const tagsOptions = traceFilterOptions.data?.tags || [];
   const modelOptions = generationsFilterOptions.data?.model || [];
   const toolNamesOptions = generationsFilterOptions.data?.toolNames || [];
+  const observationLevelOptions = [
+    { value: "DEBUG" },
+    { value: "DEFAULT" },
+    { value: "WARNING" },
+    { value: "ERROR" },
+  ];
 
   // Filter columns for PopoverFilterBuilder
   const filterColumns: ColumnDefinition[] = [
@@ -649,6 +679,13 @@ export function WidgetForm({
       options: modelOptions,
       internal: "internalValue",
     });
+    filterColumns.push({
+      name: "Level",
+      id: "level",
+      type: "stringOptions",
+      options: observationLevelOptions,
+      internal: "internalValue",
+    });
   }
   if (selectedView === "scores-categorical") {
     filterColumns.push({
@@ -702,7 +739,8 @@ export function WidgetForm({
   }, [viewVersion, selectedView, selectedMeasure]);
 
   const measureSupportsHistogram =
-    validAggregationsForMeasure.includes("histogram");
+    validAggregationsForMeasure.includes("histogram") &&
+    selectedMeasure !== "count";
 
   // Sync aggregation and chart type when selections change
   useEffect(() => {
@@ -968,6 +1006,11 @@ export function WidgetForm({
   const chartLoadingState = getChartLoadingStateProps({
     isPending: queryResult.isPending,
     isError: queryResult.isError,
+  });
+  const loadingProgress = getChartLoadingProgress({
+    isPending: queryResult.isPending,
+    progress: null,
+    useBackendProgress: false,
   });
 
   // Transform the query results to a consistent format for charts
@@ -1342,7 +1385,7 @@ export function WidgetForm({
                                   variant="ghost"
                                   size="sm"
                                   onClick={() => removeMetricSlot(index)}
-                                  className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive"
+                                  className="text-muted-foreground hover:text-destructive h-6 w-6 p-0"
                                 >
                                   <X className="h-4 w-4" />
                                 </Button>
@@ -1500,7 +1543,7 @@ export function WidgetForm({
                           </SelectContent>
                         </Select>
                         {selectedChartType === "HISTOGRAM" && (
-                          <p className="text-xs text-muted-foreground">
+                          <p className="text-muted-foreground text-xs">
                             Aggregation is automatically set to
                             &quot;histogram&quot; for histogram charts
                           </p>
@@ -1573,7 +1616,7 @@ export function WidgetForm({
                     <h4 className="mb-2 text-sm font-semibold">
                       Row Dimensions
                     </h4>
-                    <p className="mb-3 text-xs text-muted-foreground">
+                    <p className="text-muted-foreground mb-3 text-xs">
                       Configure up to {MAX_PIVOT_TABLE_DIMENSIONS} dimensions
                       for pivot table rows. Each dimension creates groupings
                       with subtotals.
@@ -1651,7 +1694,7 @@ export function WidgetForm({
                     <h4 className="mb-2 text-sm font-semibold">
                       Default Sort Configuration
                     </h4>
-                    <p className="mb-3 text-xs text-muted-foreground">
+                    <p className="text-muted-foreground mb-3 text-xs">
                       Configure the default sort order for the pivot table. This
                       will be applied when the widget is first loaded.
                     </p>
@@ -1888,53 +1931,55 @@ export function WidgetForm({
                 </Alert>
               </div>
             </CardContent>
-          ) : queryResult.data ? (
-            <div className="relative min-h-0 flex-1">
-              <Chart
-                chartType={selectedChartType as DashboardWidgetChartType}
-                data={transformedData}
-                rowLimit={rowLimit}
-                chartConfig={
-                  selectedChartType === "PIVOT_TABLE"
-                    ? {
-                        type: selectedChartType as DashboardWidgetChartType,
-                        dimensions: pivotDimensions,
-                        row_limit: rowLimit,
-                        metrics: selectedMetrics.map((metric) => metric.id), // Pass metric field names
-                        defaultSort:
-                          defaultSortColumn && defaultSortColumn !== "none"
-                            ? {
-                                column: defaultSortColumn,
-                                order: defaultSortOrder,
-                              }
-                            : undefined,
-                      }
-                    : selectedChartType === "HISTOGRAM"
+          ) : queryResult.data || chartLoadingState.isLoading ? (
+            <div className="flex min-h-0 flex-1 flex-col">
+              <div className="relative min-h-0 flex-1">
+                <Chart
+                  chartType={selectedChartType as DashboardWidgetChartType}
+                  data={transformedData}
+                  rowLimit={rowLimit}
+                  chartConfig={
+                    selectedChartType === "PIVOT_TABLE"
                       ? {
                           type: selectedChartType as DashboardWidgetChartType,
-                          bins: histogramBins,
-                        }
-                      : {
-                          type: selectedChartType as DashboardWidgetChartType,
+                          dimensions: pivotDimensions,
                           row_limit: rowLimit,
+                          metrics: selectedMetrics.map((metric) => metric.id), // Pass metric field names
+                          defaultSort:
+                            defaultSortColumn && defaultSortColumn !== "none"
+                              ? {
+                                  column: defaultSortColumn,
+                                  order: defaultSortOrder,
+                                }
+                              : undefined,
                         }
-                }
-                sortState={
-                  selectedChartType === "PIVOT_TABLE"
-                    ? previewSortState
-                    : undefined
-                }
-                onSortChange={undefined}
-                isLoading={queryResult.isPending}
-              />
-              <ChartLoadingState
-                isLoading={chartLoadingState.isLoading}
-                showSpinner={chartLoadingState.showSpinner}
-                showHintImmediately={chartLoadingState.showHintImmediately}
-                hintText={chartLoadingState.hintText}
-                className="absolute inset-0 z-20 bg-background/80 backdrop-blur-sm"
-                hintClassName="max-w-sm px-4"
-              />
+                      : selectedChartType === "HISTOGRAM"
+                        ? {
+                            type: selectedChartType as DashboardWidgetChartType,
+                            bins: histogramBins,
+                          }
+                        : {
+                            type: selectedChartType as DashboardWidgetChartType,
+                            row_limit: rowLimit,
+                          }
+                  }
+                  sortState={
+                    selectedChartType === "PIVOT_TABLE"
+                      ? previewSortState
+                      : undefined
+                  }
+                  onSortChange={undefined}
+                  isLoading={queryResult.isPending}
+                />
+                <ChartLoadingState
+                  isLoading={chartLoadingState.isLoading}
+                  showSpinner={chartLoadingState.showSpinner}
+                  showHintImmediately={chartLoadingState.showHintImmediately}
+                  hintText={chartLoadingState.hintText}
+                  progress={loadingProgress}
+                  className="bg-background/80 absolute inset-0 z-20 backdrop-blur-xs"
+                />
+              </div>
             </div>
           ) : (
             <CardContent>
@@ -1945,7 +1990,7 @@ export function WidgetForm({
                     showSpinner={chartLoadingState.showSpinner}
                     showHintImmediately={chartLoadingState.showHintImmediately}
                     hintText={chartLoadingState.hintText}
-                    hintClassName="max-w-sm px-4"
+                    progress={loadingProgress}
                   />
                 ) : (
                   <p className="text-muted-foreground">

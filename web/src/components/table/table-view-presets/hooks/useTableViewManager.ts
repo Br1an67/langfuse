@@ -6,7 +6,6 @@ import {
   type TableViewPresetState,
   type ColumnDefinition,
 } from "@langfuse/shared";
-import { type DefaultViewScope } from "@langfuse/shared/src/server";
 import { useRouter } from "next/router";
 import { useEffect, useCallback, useState, useRef } from "react";
 import { type VisibilityState } from "@tanstack/react-table";
@@ -31,12 +30,14 @@ interface TableStateUpdaters {
 interface UseTableStateProps {
   tableName: TableViewPresetTableName;
   projectId: string;
+  viewPersistenceKey?: string;
   stateUpdaters: TableStateUpdaters;
   validationContext?: {
     columns?: LangfuseColumnDef<any, any>[];
     filterColumnDefinition?: ColumnDefinition[];
   };
   currentFilterState?: FilterState;
+  disabled?: boolean;
 }
 
 /**
@@ -45,9 +46,11 @@ interface UseTableStateProps {
 export function useTableViewManager({
   projectId,
   tableName,
+  viewPersistenceKey,
   stateUpdaters,
   validationContext = {},
   currentFilterState,
+  disabled = false,
 }: UseTableStateProps) {
   const router = useRouter();
   const isRouterReady = router.isReady;
@@ -56,9 +59,14 @@ export function useTableViewManager({
   const capture = usePostHogClientCapture();
   const pendingFiltersRef = useRef<FilterState | null>(null);
   const pendingFiltersPreviousStateRef = useRef<FilterState | null>(null);
+  // Session storage needs a mode-specific key because the same tableName can be
+  // rendered by different route variants (for example legacy vs v4 pages) with
+  // distinct saved-view IDs. Reusing tableName would restore stale IDs across
+  // modes and boot the user into an incompatible saved view.
+  const resolvedViewPersistenceKey = viewPersistenceKey ?? tableName;
 
   const [storedViewId, setStoredViewId] = useSessionStorage<string | null>(
-    `${tableName}-${projectId}-viewId`,
+    `${resolvedViewPersistenceKey}-${projectId}-viewId`,
     null,
   );
   const [selectedViewIdParam, setSelectedViewId] = useQueryParam(
@@ -76,7 +84,7 @@ export function useTableViewManager({
     api.TableViewPresets.getDefault.useQuery(
       { projectId, viewName: tableName },
       {
-        enabled: !!projectId,
+        enabled: !!projectId && !disabled,
         staleTime: 5 * 60 * 1000, // Cache for 5 minutes
       },
     );
@@ -124,6 +132,7 @@ export function useTableViewManager({
   // Single resolve effect: walk priority list and either return early (pending) or initialize.
   // `selectedViewId` (use-query-params state) is the single source of truth for bootstrap/fetch.
   useEffect(() => {
+    if (disabled) return;
     if (isInitialized) return;
     if (!isRouterReady) return;
 
@@ -166,6 +175,7 @@ export function useTableViewManager({
     setIsInitialized(true);
     setIsLoading(false);
   }, [
+    disabled,
     isInitialized,
     isRouterReady,
     selectedViewId,
@@ -192,6 +202,7 @@ export function useTableViewManager({
         validOrderBy = validateOrderBy(
           viewData.orderBy,
           validationContext.columns,
+          validationContext.filterColumnDefinition,
         );
       }
 
@@ -267,6 +278,7 @@ export function useTableViewManager({
     { viewId: selectedViewId as string, projectId },
     {
       enabled:
+        !disabled &&
         isRouterReady &&
         !!selectedViewId &&
         !isInitialized &&
@@ -275,12 +287,17 @@ export function useTableViewManager({
   );
 
   useEffect(() => {
+    if (disabled) return;
     if (!isSelectedViewSuccess || !selectedViewData) return;
     const requestedViewId = selectedViewId;
     if (!requestedViewId) return;
     if (isInitializedRef.current) return;
     if (selectedViewIdRef.current !== requestedViewId) return;
     if (selectedViewData.id !== requestedViewId) return;
+    if (selectedViewData.tableName !== tableName) {
+      handleSetViewId(null);
+      return;
+    }
 
     // Track permalink visit
     capture("saved_views:permalink_visit", {
@@ -293,15 +310,18 @@ export function useTableViewManager({
     isInitializedRef.current = true;
     setIsInitialized(true);
   }, [
+    disabled,
     isSelectedViewSuccess,
     selectedViewData,
     selectedViewId,
+    handleSetViewId,
     capture,
     tableName,
     applyViewState,
   ]);
 
   useEffect(() => {
+    if (disabled) return;
     if (!isSelectedViewError || !selectedViewError) return;
     const requestedViewId = selectedViewId;
     if (!requestedViewId) return;
@@ -313,7 +333,13 @@ export function useTableViewManager({
     setIsLoading(false);
     handleSetViewId(null);
     showErrorToast("Error applying view", selectedViewError.message, "WARNING");
-  }, [isSelectedViewError, selectedViewError, selectedViewId, handleSetViewId]);
+  }, [
+    disabled,
+    isSelectedViewError,
+    selectedViewError,
+    selectedViewId,
+    handleSetViewId,
+  ]);
 
   // Observe when filter state propagates from saved view
   // After calling setFilters, URL updates async → filterState recalculates → this effect detects completion
@@ -338,11 +364,21 @@ export function useTableViewManager({
     }
   }, [currentFilterState]);
 
+  if (disabled) {
+    return {
+      isLoading: false,
+      applyViewState: () => {},
+      handleSetViewId: () => {},
+      selectedViewId: null,
+      defaultViewScope: null,
+    };
+  }
+
   return {
     isLoading,
     applyViewState,
     handleSetViewId,
     selectedViewId,
-    defaultViewScope: resolvedDefault?.scope as DefaultViewScope | null,
+    defaultViewScope: resolvedDefault?.scope ?? null,
   };
 }
